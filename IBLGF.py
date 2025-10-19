@@ -4,6 +4,7 @@ import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.linear_model import Ridge
 from sklearn.linear_model import Lasso
+import multiprocessing as mp
 import pandas as pd
 from scipy import stats
 from scipy.optimize import minimize
@@ -11,21 +12,29 @@ from numpy import linalg as LA
 import scipy
 import scipy.signal
 
+import sys
+sys.path.append('../Fast-Screened-Poisson-LGF/src')
+import LGF_funcs as LGF
+
 # define solution enviroment
 class sol:
-    def __init__(self, dx, cfl, cg_th, nx, ny, nx_ll = 0, ny_ll = 0, Re = 100):
+    def __init__(self, dx, dy, cfl, cg_th, nx, ny, nx_ll = 0, ny_ll = 0, Re = 100):
         # dx is the spatial resilution
         # cfl is the time steps size relative to dx
         # nx, ny are number of grid points in each direction
         # nx_ll and ny_ll are the location of the lower left corner coordinate
         self.dx = dx
-        self.dt = dx*cfl
+        self.dy = dy
+        self.xyratio = dx/dy
+        self.xyratio2 = self.xyratio * self.xyratio
+        self.dt = self.dx*cfl
         self.cg_th = cg_th
         self.nx = nx
         self.ny = ny
         self.Re = Re
         self.nx_ll = nx_ll
         self.ny_ll = ny_ll
+        self.dxibdx = 1.5
         
         self.nIBP = 0
         
@@ -67,11 +76,11 @@ class sol:
                 idx = int((i*(i-1))/2 + j -1)
                 self.coeff_a[i, j] = self.a_[idx]
         
-        for i in range(self.nx):
-            for j in range(self.ny):
-                x = i*self.dx - self.nx*self.dx/2
-                y = j*self.dx - self.ny*self.dx/2
-                r = np.sqrt(x**2 + y**2)
+        #for i in range(self.nx):
+        #    for j in range(self.ny):
+        #        x = i*self.dx - self.nx*self.dx/2
+        #        y = j*self.dx - self.ny*self.dx/2
+        #        r = np.sqrt(x**2 + y**2)
                 #self.u[0,j,i] = self.u_taylor_vort(x,y+self.dx/2,0,0)
                 #self.u[1,j,i] = self.u_taylor_vort(x+self.dx/2,y,0,1)
                 #self.u[0,j,i] = self.u_oseen_vort(x, y+self.dx/2, 0, 0)
@@ -86,7 +95,8 @@ class sol:
         f = pd.read_csv('lgf_more.txt', header=None, delimiter=',')
         self.lgf_dat = f.iloc[:,0].to_numpy()
         
-        self.generateLGF_read()
+        #self.generateLGF_read()
+        self.compute_LGF_int()
         self.integratingFactor_init()
         
         self.init_shape()
@@ -126,6 +136,19 @@ class sol:
                     self.LGF[j,i] = -self.lgf_dat[idx]
                 else:
                     self.LGF[j,i] = -self.LGF_asym(i_abs, j_abs)
+
+    def compute_LGF_int(self):
+        self.LGF = np.zeros((self.ny*2+1, self.nx*2+1))
+        with mp.Pool(processes=mp.cpu_count()) as pool:
+            results = pool.starmap(self.eval_lgf, [(j_abs, i_abs) for i in range(self.nx, self.nx*2+1) for j in range(self.ny, self.ny*2+1) for i_abs in [abs(i - self.nx)] for j_abs in [abs(j - self.ny)]])
+            for (j,i), res in zip([(j,i) for i in range(self.nx, self.nx*2+1) for j in range(self.ny,self.ny*2+1)], results):
+                self.LGF[j,i] = res
+
+        for i in range(self.nx*2+1):
+            for j in range(self.ny*2+1):
+                i_abs = abs(i - self.nx)
+                j_abs = abs(j - self.ny)
+                self.LGF[j,i] = self.LGF[j_abs+self.ny,i_abs+self.nx]
                 
     def LGF_asym(self,n,m):
         Cfund = -0.18124942796
@@ -136,8 +159,8 @@ class sol:
         res = -0.5/np.pi*np.log(r) + Cfund + Integral_val + second_term
         return res
                 
-    def eval_lgf(self, c, n, m):
-        integrand = lambda t: self.integrand_g(t,n, m)
+    def eval_lgf(self, n, m):
+        integrand = lambda t: self.integrand_g(t, n, m)
         val1 = scipy.integrate.quad(integrand, -np.pi, -1e-15)
         val2 = scipy.integrate.quad(integrand, 1e-15, np.pi)
         #val2 = scipy.integrate.quad(integrand, -np.pi, np.pi)
@@ -145,10 +168,10 @@ class sol:
         return val
     
     def integrand_g(self, t, n, m):
-        a = 4 - np.cos(t)*2
+        a = 2 + 2 * self.xyratio2 - np.cos(t)*2*self.xyratio2
         K = (a + np.sqrt(np.square(a) - 4))/2
 
-        I = 1/2/np.pi*(1 - np.exp(1j*t*m) * (1/K)**n ) / (K - 1/K);
+        I = 1/2/np.pi*(1 - np.exp(1j*t*n) * (1/K)**m ) / (K - 1/K)
 
         return I
     
@@ -161,12 +184,12 @@ class sol:
                     i_abs = abs(i - 20)
                     j_abs = abs(j - 20)
                     #res = self.eval_lgf(0, i_abs, j_abs)
-                    self.IF[n, i,j] = np.exp(-4*alpha_t)*scipy.special.iv(i_abs, 2*alpha_t) \
+                    self.IF[n, i,j] = np.exp(-2*alpha_t-2*alpha_t*self.xyratio*self.xyratio)*scipy.special.iv(i_abs, 2*alpha_t*self.xyratio*self.xyratio) \
                     *scipy.special.iv(j_abs, 2*alpha_t)
                     
     def init_shape(self):
         r = 0.5
-        self.nIBP = int(np.ceil(np.pi*2*r / self.dx / 1.2))
+        self.nIBP = int(np.ceil(np.pi*2*r / self.dx / self.dxibdx))
         self.IBP = np.zeros((self.nIBP, 2))
         for i in range(self.nIBP):
             th = 2*np.pi*i/self.nIBP
@@ -183,10 +206,10 @@ class sol:
             y = self.IBP[i,1]
             
             x_ctr = int(np.ceil(x/self.dx)) + self.nx_ll
-            y_ctr = int(np.ceil(y/self.dx)) + self.ny_ll
+            y_ctr = int(np.ceil(y/self.dy)) + self.ny_ll
             
             x_loc = x/self.dx + self.nx_ll
-            y_loc = y/self.dx + self.ny_ll
+            y_loc = y/self.dy + self.ny_ll
             
             for j in range(-3, 4):
                 for k in range(-3, 4):
@@ -204,10 +227,10 @@ class sol:
             y = self.IBP[i,1]
             
             x_ctr = int(np.ceil(x/self.dx)) + self.nx_ll
-            y_ctr = int(np.ceil(y/self.dx)) + self.ny_ll
+            y_ctr = int(np.ceil(y/self.dy)) + self.ny_ll
             
             x_loc = x/self.dx + self.nx_ll
-            y_loc = y/self.dx + self.ny_ll
+            y_loc = y/self.dy + self.ny_ll
             
             for j in range(-3, 4):
                 for k in range(-3, 4):
@@ -410,16 +433,16 @@ class sol:
     def Dy(self, field):
         dy_v = np.zeros((3,1))
         dy_v[0] = 0
-        dy_v[1] = 1/self.dx
-        dy_v[2] = -1/self.dx
+        dy_v[1] = 1/self.dy
+        dy_v[2] = -1/self.dy
         res = scipy.signal.convolve(field, dy_v, mode='same')
         return res
     
     def Dy_t(self, field):
         dy_v = np.zeros((3,1))
-        dy_v[1] = -1/self.dx
+        dy_v[1] = -1/self.dy
         dy_v[2] = 0
-        dy_v[0] = 1/self.dx
+        dy_v[0] = 1/self.dy
         res = scipy.signal.convolve(field, dy_v, mode='same')
         return res
     
@@ -497,6 +520,10 @@ class sol:
         #IB
         self.Apply_IF_vec(self.face_aux2, self.face_aux2, stage)
         self.forcing = self.ib_solve(self.face_aux2, stage)
+
+        if stage == 2:
+            F = np.sum(self.forcing, axis=0) * self.dx * self.dy / (self.dt*self.coeff_a[3,3])
+            print('Total IB force: ', F)
         
         self.pressure_correction(self.forcing, self.d_i)
         self.Grad(self.d_i, self.face_aux)
