@@ -39,9 +39,29 @@ class sol:
         self.nIBP = 0
         
         self.t = 0.0
-        
-        
-        
+
+
+
+        self.dx_v = np.zeros((1,3))
+        self.dx_v[0, 0] = 0
+        self.dx_v[0, 1] = 1/self.dx
+        self.dx_v[0, 2] = -1/self.dx
+
+        self.dx_v_t = np.zeros((1,3))
+        self.dx_v_t[0, 1] = -1/self.dx
+        self.dx_v_t[0, 2] = 0
+        self.dx_v_t[0, 0] = 1/self.dx
+
+        self.dy_v = np.zeros((3,1))
+        self.dy_v[0] = 0
+        self.dy_v[1] = 1/self.dy
+        self.dy_v[2] = -1/self.dy
+
+        self.dy_v_t = np.zeros((3,1))
+        self.dy_v_t[1] = -1/self.dy
+        self.dy_v_t[2] = 0
+        self.dy_v_t[0] = 1/self.dy
+
         self.use_direct_solve=True
         
         
@@ -57,6 +77,7 @@ class sol:
         self.u_i = np.zeros((2, self.ny, self.nx))
         self.p   = np.zeros((1, self.ny, self.nx))
         self.p_i = np.zeros((1, self.ny, self.nx))
+        self.stream = np.zeros((1, self.ny, self.nx))
         self.cell_aux2 = np.zeros((1, self.ny, self.nx))
         
         self.g_i = np.zeros((2, self.ny, self.nx))
@@ -95,8 +116,8 @@ class sol:
         f = pd.read_csv('lgf_more.txt', header=None, delimiter=',')
         self.lgf_dat = f.iloc[:,0].to_numpy()
         
-        #self.generateLGF_read()
-        self.compute_LGF_int()
+        self.generateLGF_read()
+        #self.compute_LGF_int()
         self.integratingFactor_init()
         
         self.init_shape()
@@ -412,66 +433,67 @@ class sol:
             target[i] = self.Apply_IF(source[i], stage)
     
     def Dx(self, field):
-        dx_v = np.zeros((1,3))
-        dx_v[0, 0] = 0
-        dx_v[0, 1] = 1/self.dx
-        dx_v[0, 2] = -1/self.dx
-        res = scipy.signal.convolve(field, dx_v, mode='same')
+        
+        res = scipy.signal.convolve(field, self.dx_v, mode='same')
         return res
     
     def Dx_t(self, field):
-        #Dx_t is f(k) = g(k+1) - g(k)
+        #Dx_t is f(k) = g(k) - g(k - 1)
         #so it is sum_{i+j = k} K(i)g(j) = sum_{i+j = 0} K(i)g(k+j)
         #K(0) = -1, K(-1) = 1
-        dx_v = np.zeros((1,3))
-        dx_v[0, 1] = -1/self.dx
-        dx_v[0, 2] = 0
-        dx_v[0, 0] = 1/self.dx
-        res = scipy.signal.convolve(field, dx_v, mode='same')
+
+        res = scipy.signal.convolve(field, self.dx_v_t, mode='same')
         return res
     
     def Dy(self, field):
-        dy_v = np.zeros((3,1))
-        dy_v[0] = 0
-        dy_v[1] = 1/self.dy
-        dy_v[2] = -1/self.dy
-        res = scipy.signal.convolve(field, dy_v, mode='same')
+        res = scipy.signal.convolve(field, self.dy_v, mode='same')
         return res
     
     def Dy_t(self, field):
-        dy_v = np.zeros((3,1))
-        dy_v[1] = -1/self.dy
-        dy_v[2] = 0
-        dy_v[0] = 1/self.dy
-        res = scipy.signal.convolve(field, dy_v, mode='same')
+        res = scipy.signal.convolve(field, self.dy_v_t, mode='same')
         return res
     
-    def cleanBdry(self, field):
+    def cleanBdry(self, field, n_grid = 1):
         for i in range(len(field)):
-            field[i, 0,:] = 0
-            field[i, -1, :] = 0
-            field[i, :, 0] = 0
-            field[i, :, -1] = 0
+            field[i, 0:n_grid,:] = 0
+            field[i, -n_grid:, :] = 0
+            field[i, :, 0:n_grid] = 0
+            field[i, :, -n_grid:] = 0
     
     def Div(self, source, target):
         if (len(source) == 1):
             print("wrong field for divergence")
         target[0] = self.Dx_t(source[0])
         target[0] += self.Dy_t(source[1])
-        self.cleanBdry(target)
+        self.cleanBdry(target, 2)
         
     def Grad(self, source, target):
         if (len(source) != 1):
             print("wrong field for gradient")
         target[0] = self.Dx(source[0])
         target[1] = self.Dy(source[0])
-        self.cleanBdry(target)
+        self.cleanBdry(target, 2)
         
     def Curl(self, source, target):
         if (len(source) == 1):
             print("wrong field for curl")
         target[0] = self.Dx(source[1]) - self.Dy(source[0])
-        self.cleanBdry(target)
+        self.cleanBdry(target, 2)
+
+    def Curl_t(self, source, target):
+        if (len(source) != 1):
+            print("wrong field for curl transpose")
+        target[0] = self.Dy_t(source[0])
+        target[1] -= self.Dx_t(source[0])
+        self.cleanBdry(target, 1)
+
+    def velocity_refresh(self, vel, vort):
+        self.Curl(vel, vort)
+        self.cleanBdry(vort, 5)
+        self.Apply_lgf_vec(vort, self.stream)
+        self.Curl_t(self.stream, vel)
+        vel *= -1
+        
         
     def nonlinear(self, vort, vel_raw, vel, target):
         #vel[:,:,:] = vel_raw[:,:,:] - self.U_inf()
@@ -523,7 +545,7 @@ class sol:
 
         if stage == 2:
             F = np.sum(self.forcing, axis=0) * self.dx * self.dy / (self.dt*self.coeff_a[3,3])
-            print('Total IB force: ', F)
+            print('At ', self.t, ' Total IB force: ', F)
         
         self.pressure_correction(self.forcing, self.d_i)
         self.Grad(self.d_i, self.face_aux)
@@ -545,7 +567,7 @@ class sol:
         self.r_i -= self.face_aux
         self.Apply_IF_vec(self.r_i, self.u_i, stage)
     
-    def IFHERK_step(self):
+    def IFHERK_step(self, dt):
         self.q_i[:,:,:] = self.u[:,:,:]
         # stage 1
         self.g_i[:,:,:] = 0
@@ -558,7 +580,7 @@ class sol:
         
         self.Curl(self.u, self.omega)
         self.nonlinear(self.omega, self.u, self.face_aux, self.g_i)
-        self.g_i *= (-self.dt)*self.coeff_a[1,1]
+        self.g_i *= (-dt)*self.coeff_a[1,1]
         self.r_i[:,:,:] = self.q_i[:,:,:]
         self.r_i += self.g_i
         
@@ -567,7 +589,7 @@ class sol:
         else:
             self.lin_sys_with_ib_solve(0)
             
-        self.t += self.dt*self.RK[0]
+        self.t += dt*self.RK[0]
         
         #stage 2
         self.r_i[:,:,:] = 0
@@ -576,16 +598,16 @@ class sol:
         
         self.face_aux -= self.g_i
         self.w_1[:,:,:] = self.face_aux[:,:,:]
-        self.w_1 *= (-1/self.dt/self.coeff_a[1,1])
+        self.w_1 *= (-1/dt/self.coeff_a[1,1])
         self.Apply_IF_vec(self.q_i, self.q_i,0)
         self.Apply_IF_vec(self.w_1, self.w_1,0)
         
         self.r_i += self.q_i
-        self.r_i += self.w_1 * self.coeff_a[2,1] * self.dt
+        self.r_i += self.w_1 * self.coeff_a[2,1] * dt
         
         self.Curl(self.u_i, self.omega)
         self.nonlinear(self.omega, self.u_i, self.face_aux, self.g_i)
-        self.g_i *= (-self.dt)*self.coeff_a[2,2]
+        self.g_i *= (-dt)*self.coeff_a[2,2]
         
         self.r_i += self.g_i
         
@@ -594,7 +616,7 @@ class sol:
         else:
             self.lin_sys_with_ib_solve(1)
             
-        self.t += self.dt*self.RK[1]
+        self.t += dt*self.RK[1]
         
         #stage 3
         self.d_i[:,:,:] = 0
@@ -602,16 +624,16 @@ class sol:
         self.w_2[:,:,:] = 0
         self.face_aux -= self.g_i
         self.w_2[:,:,:] = self.face_aux[:,:,:]
-        self.w_2 *= (-1/self.dt/self.coeff_a[2,2])
+        self.w_2 *= (-1/dt/self.coeff_a[2,2])
         self.r_i[:,:,:] = self.q_i[:,:,:]
-        self.r_i += self.w_1 * self.coeff_a[3,1]*self.dt
-        self.r_i += self.w_2 * self.coeff_a[3,2]*self.dt
+        self.r_i += self.w_1 * self.coeff_a[3,1]*dt
+        self.r_i += self.w_2 * self.coeff_a[3,2]*dt
         
         self.Apply_IF_vec(self.r_i, self.r_i, 1)
         
         self.Curl(self.u_i, self.omega)
         self.nonlinear(self.omega, self.u_i, self.face_aux, self.g_i)
-        self.g_i *= (-self.dt)*self.coeff_a[3,3]
+        self.g_i *= (-dt)*self.coeff_a[3,3]
         self.r_i += self.g_i
         
         if self.nIBP == 0:
@@ -619,17 +641,22 @@ class sol:
         else:
             self.lin_sys_with_ib_solve(2)
             
-        self.t += self.dt*self.RK[2]
+        self.t += dt*self.RK[2]
         
         #finalize
         self.u[:,:,:] = self.u_i[:,:,:]
         self.p[:,:,:] = self.d_i[:,:,:]
-        self.p /= (self.coeff_a[3,3] * self.dt)
+        self.p /= (self.coeff_a[3,3] * dt)
         
     def time_march(self, n_steps):
         for i in range(n_steps):
-            self.IFHERK_step()
+            self.IFHERK_step(self.dt)
             print('step ',i)
+
+            if ((i + 1) % 100 == 0):
+                print('Refreshing velocity field at step ', i+1)
+                self.velocity_refresh(self.u, self.omega)
+                
         
     def u_taylor_vort(self, x, y, td, idx):
         R_ = 1
