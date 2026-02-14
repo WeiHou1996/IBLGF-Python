@@ -11,6 +11,7 @@ from scipy.optimize import minimize
 from numpy import linalg as LA
 import scipy
 import scipy.signal
+import scipy.fft
 
 import sys
 sys.path.append('../Fast-Screened-Poisson-LGF/src')
@@ -18,7 +19,7 @@ import LGF_funcs as LGF
 
 # define solution enviroment
 class sol:
-    def __init__(self, dx, dy, cfl, cg_th, nx, ny, nx_ll = 0, ny_ll = 0, Re = 100):
+    def __init__(self, dx, dy, cfl, cg_th, nx, ny, nx_ll = 0, ny_ll = 0, Re = 100, dxdibdx = 1.5):
         # dx is the spatial resilution
         # cfl is the time steps size relative to dx
         # nx, ny are number of grid points in each direction
@@ -34,7 +35,7 @@ class sol:
         self.Re = Re
         self.nx_ll = nx_ll
         self.ny_ll = ny_ll
-        self.dxibdx = 1.5
+        self.dxibdx = dxdibdx
         
         self.nIBP = 0
         
@@ -74,6 +75,7 @@ class sol:
         self.U_infty = -1
         
         self.u   = np.zeros((2, self.ny, self.nx))
+        self._u_refresh   = np.zeros((2, self.ny, self.nx))
         self.u_i = np.zeros((2, self.ny, self.nx))
         self.p   = np.zeros((1, self.ny, self.nx))
         self.p_i = np.zeros((1, self.ny, self.nx))
@@ -116,9 +118,10 @@ class sol:
         f = pd.read_csv('lgf_more.txt', header=None, delimiter=',')
         self.lgf_dat = f.iloc[:,0].to_numpy()
         
-        self.generateLGF_read()
-        #self.compute_LGF_int()
+        #self.generateLGF_read()
+        self.compute_LGF_int()
         self.integratingFactor_init()
+        self.prepare_fast_lgf()
         
         self.init_shape()
         self.construct_Projection_sparse()
@@ -415,22 +418,68 @@ class sol:
             np.sqrt(3) / 36.0 * np.arcsin(np.sqrt(3) / 2.0 * (2 * r - 3.0))
         return ddf
             
-    def Apply_lgf(self, field):
-        res = scipy.signal.convolve(field, self.LGF, mode='same')
+    def prepare_fast_lgf(self):
+        # Determine optimal FFT shape for linear convolution
+        s_field = (self.ny, self.nx)
+        s_lgf = self.LGF.shape
+        shape = (s_field[0] + s_lgf[0] - 1, s_field[1] + s_lgf[1] - 1)
+        self.fft_shape = (scipy.fft.next_fast_len(shape[0]), scipy.fft.next_fast_len(shape[1]))
+        
+        # Precompute FFT of LGF
+        self.LGF_fft = scipy.fft.fft2(self.LGF, self.fft_shape)
+        
+        # Calculate slicing indices to emulate mode='same' (centered)
+        start_y = (shape[0] - self.ny) // 2
+        start_x = (shape[1] - self.nx) // 2
+        self.lgf_slice = (slice(start_y, start_y + self.ny), slice(start_x, start_x + self.nx))
+        
+        # Precompute FFT for IF
+        s_if = self.IF.shape[1:]
+        shape_if = (s_field[0] + s_if[0] - 1, s_field[1] + s_if[1] - 1)
+        self.if_fft_shape = (scipy.fft.next_fast_len(shape_if[0]), scipy.fft.next_fast_len(shape_if[1]))
+        
+        self.IF_fft = scipy.fft.fft2(self.IF, self.if_fft_shape, axes=(1, 2))
+        
+        start_y_if = (shape_if[0] - self.ny) // 2
+        start_x_if = (shape_if[1] - self.nx) // 2
+        self.if_slice = (slice(start_y_if, start_y_if + self.ny), slice(start_x_if, start_x_if + self.nx))
+
+    def Apply_lgf(self, field, workers=-1):
+        field_fft = scipy.fft.fft2(field, self.fft_shape, workers=workers)
+        res_fft = field_fft * self.LGF_fft
+        res = scipy.fft.ifft2(res_fft, workers=workers)
+        res = res[self.lgf_slice].real
         res = res*self.dx*self.dx
         return res
     
     def Apply_lgf_vec(self, source, target):
-        for i in range(len(source)):
-            target[i] = self.Apply_lgf(source[i])
+        n_proc = min(len(source), mp.cpu_count())
+        if n_proc > 1:
+            with mp.pool.ThreadPool(processes=n_proc) as pool:
+                results = pool.starmap(self.Apply_lgf, [(s, 1) for s in source])
+            for i, res in enumerate(results):
+                target[i] = res
+        else:
+            for i in range(len(source)):
+                target[i] = self.Apply_lgf(source[i], workers=-1)
     
-    def Apply_IF(self, field, stage):
-        res = scipy.signal.convolve(field, self.IF[stage], mode='same')
+    def Apply_IF(self, field, stage, workers=-1):
+        field_fft = scipy.fft.fft2(field, self.if_fft_shape, workers=workers)
+        res_fft = field_fft * self.IF_fft[stage]
+        res = scipy.fft.ifft2(res_fft, workers=workers)
+        res = res[self.if_slice].real
         return res
     
     def Apply_IF_vec(self, source, target, stage):
-        for i in range(len(source)):
-            target[i] = self.Apply_IF(source[i], stage)
+        n_proc = min(len(source), mp.cpu_count())
+        if n_proc > 1:
+            with mp.pool.ThreadPool(processes=n_proc) as pool:
+                results = pool.starmap(self.Apply_IF, [(s, stage, 1) for s in source])
+            for i, res in enumerate(results):
+                target[i] = res
+        else:
+            for i in range(len(source)):
+                target[i] = self.Apply_IF(source[i], stage, workers=-1)
     
     def Dx(self, field):
         
@@ -465,36 +514,42 @@ class sol:
             print("wrong field for divergence")
         target[0] = self.Dx_t(source[0])
         target[0] += self.Dy_t(source[1])
-        self.cleanBdry(target, 2)
         
     def Grad(self, source, target):
         if (len(source) != 1):
             print("wrong field for gradient")
         target[0] = self.Dx(source[0])
         target[1] = self.Dy(source[0])
-        self.cleanBdry(target, 2)
         
     def Curl(self, source, target):
         if (len(source) == 1):
             print("wrong field for curl")
         target[0] = self.Dx(source[1]) - self.Dy(source[0])
-        self.cleanBdry(target, 2)
 
     def Curl_t(self, source, target):
         if (len(source) != 1):
             print("wrong field for curl transpose")
         target[0] = self.Dy_t(source[0])
         target[1] -= self.Dx_t(source[0])
-        self.cleanBdry(target, 1)
 
     def velocity_refresh(self, vel, vort):
         self.Curl(vel, vort)
-        self.cleanBdry(vort, 5)
+        self.cleanBdry(vort, 6)
         self.Apply_lgf_vec(vort, self.stream)
-        self.Curl_t(self.stream, vel)
-        vel *= -1
+        self.Curl_t(self.stream, self._u_refresh)
+        self.cleanBdry(self._u_refresh, 1)
+        self._u_refresh *= -1
+        self.assign_bdry(self._u_refresh, vel, 6)
         
         
+    def assign_bdry(self, field_from, field_to, depth):
+        for i in range(len(field_from)):
+            field_to[i, 0:depth, :] = field_from[i, 0:depth, :]
+            field_to[i, -depth:, :] = field_from[i, -depth:, :]
+            field_to[i, :, 0:depth] = field_from[i, :, 0:depth]
+            field_to[i, :, -depth:] = field_from[i, :, -depth:]
+    
+
     def nonlinear(self, vort, vel_raw, vel, target):
         #vel[:,:,:] = vel_raw[:,:,:] - self.U_inf()
         vel[0,:,:] = vel_raw[0,:,:] - self.U_inf()
@@ -536,6 +591,7 @@ class sol:
         self.face_aux2[:,:,:] = self.r_i[:,:,:]
         
         self.Grad(self.d_i, self.face_aux)
+        self.cleanBdry(self.face_aux, 6)
         
         self.face_aux2 -= self.face_aux
         
@@ -549,6 +605,7 @@ class sol:
         
         self.pressure_correction(self.forcing, self.d_i)
         self.Grad(self.d_i, self.face_aux)
+        self.cleanBdry(self.face_aux, 6)
         
         tmp = [scipy.sparse.csr_matrix((self.ny, self.nx)), scipy.sparse.csr_matrix((self.ny, self.nx))]
         self.smearing(self.forcing, tmp)
@@ -562,8 +619,10 @@ class sol:
         
     def lin_sys_solve(self, stage):
         self.Div(self.r_i, self.cell_aux)
+        self.cleanBdry(self.cell_aux, 6)
         self.Apply_lgf_vec(self.cell_aux, self.d_i)
         self.Grad(self.d_i, self.face_aux)
+        self.cleanBdry(self.face_aux, 6)
         self.r_i -= self.face_aux
         self.Apply_IF_vec(self.r_i, self.u_i, stage)
     
@@ -579,6 +638,7 @@ class sol:
         
         
         self.Curl(self.u, self.omega)
+        self.cleanBdry(self.omega, 6)
         self.nonlinear(self.omega, self.u, self.face_aux, self.g_i)
         self.g_i *= (-dt)*self.coeff_a[1,1]
         self.r_i[:,:,:] = self.q_i[:,:,:]
@@ -606,6 +666,7 @@ class sol:
         self.r_i += self.w_1 * self.coeff_a[2,1] * dt
         
         self.Curl(self.u_i, self.omega)
+        self.cleanBdry(self.omega, 6)
         self.nonlinear(self.omega, self.u_i, self.face_aux, self.g_i)
         self.g_i *= (-dt)*self.coeff_a[2,2]
         
@@ -632,6 +693,7 @@ class sol:
         self.Apply_IF_vec(self.r_i, self.r_i, 1)
         
         self.Curl(self.u_i, self.omega)
+        self.cleanBdry(self.omega, 6)
         self.nonlinear(self.omega, self.u_i, self.face_aux, self.g_i)
         self.g_i *= (-dt)*self.coeff_a[3,3]
         self.r_i += self.g_i
@@ -653,7 +715,7 @@ class sol:
             self.IFHERK_step(self.dt)
             print('step ',i)
 
-            if ((i + 1) % 100 == 0):
+            if ((i + 1) % 50 == 0):
                 print('Refreshing velocity field at step ', i+1)
                 self.velocity_refresh(self.u, self.omega)
                 
