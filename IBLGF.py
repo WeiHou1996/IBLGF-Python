@@ -12,6 +12,7 @@ from numpy import linalg as LA
 import scipy
 import scipy.signal
 import scipy.fft
+from multiprocessing.pool import ThreadPool
 
 import sys
 sys.path.append('../Fast-Screened-Poisson-LGF/src')
@@ -19,7 +20,7 @@ import LGF_funcs as LGF
 
 # define solution enviroment
 class sol:
-    def __init__(self, dx, dy, cfl, cg_th, nx, ny, nx_ll = 0, ny_ll = 0, Re = 100, dxdibdx = 1.5):
+    def __init__(self, dx, dy, cfl, cg_th, nx, ny, nx_ll = 0, ny_ll = 0, Re = 100, dxdibdx = 1.5, lgf_quad_n = 4096, lgf_asym_cutoff = 500):
         # dx is the spatial resilution
         # cfl is the time steps size relative to dx
         # nx, ny are number of grid points in each direction
@@ -64,6 +65,11 @@ class sol:
         self.dy_v_t[0] = 1/self.dy
 
         self.use_direct_solve=True
+        self.lgf_quad_n = lgf_quad_n
+        self.lgf_asym_cutoff = lgf_asym_cutoff
+        self._lgf_asym_const = None
+        self.force_history = []
+        self.symmetry_history = []
         
         
         
@@ -125,8 +131,10 @@ class sol:
         
         self.init_shape()
         self.construct_Projection_sparse()
+        self.assemble_projection_operators()
         self.IBMat = np.zeros((3, 2*self.nIBP, 2*self.nIBP))
         self.ET_H_S_E_Mat()
+        self.IBMat_lu = [scipy.linalg.lu_factor(mat) for mat in self.IBMat]
         
         
     def smoothstep(self, x):
@@ -162,17 +170,37 @@ class sol:
                     self.LGF[j,i] = -self.LGF_asym(i_abs, j_abs)
 
     def compute_LGF_int(self):
-        self.LGF = np.zeros((self.ny*2+1, self.nx*2+1))
-        with mp.Pool(processes=mp.cpu_count()) as pool:
-            results = pool.starmap(self.eval_lgf, [(j_abs, i_abs) for i in range(self.nx, self.nx*2+1) for j in range(self.ny, self.ny*2+1) for i_abs in [abs(i - self.nx)] for j_abs in [abs(j - self.ny)]])
-            for (j,i), res in zip([(j,i) for i in range(self.nx, self.nx*2+1) for j in range(self.ny,self.ny*2+1)], results):
-                self.LGF[j,i] = res
+        cutoff = self.effective_lgf_asym_cutoff()
+        if cutoff is not None:
+            self.LGF_asym_const()
 
-        for i in range(self.nx*2+1):
-            for j in range(self.ny*2+1):
-                i_abs = abs(i - self.nx)
-                j_abs = abs(j - self.ny)
-                self.LGF[j,i] = self.LGF[j_abs+self.ny,i_abs+self.nx]
+        j_abs, i_abs = np.meshgrid(
+            np.arange(self.ny + 1),
+            np.arange(self.nx + 1),
+            indexing="ij",
+        )
+        if cutoff is None:
+            direct_mask = np.ones(j_abs.shape, dtype=bool)
+        else:
+            direct_mask = j_abs + i_abs <= cutoff
+
+        quadrant = np.empty(j_abs.shape, dtype=float)
+        asym_mask = ~direct_mask
+        if np.any(asym_mask):
+            quadrant[asym_mask] = self.LGF_asym_rect(
+                j_abs[asym_mask], i_abs[asym_mask]
+            )
+
+        direct_points = np.argwhere(direct_mask)
+        if len(direct_points) > 0:
+            args = [(int(j), int(i)) for j, i in direct_points]
+            with ThreadPool(processes=min(mp.cpu_count(), len(args))) as pool:
+                results = pool.starmap(self.eval_lgf, args)
+            quadrant[direct_points[:, 0], direct_points[:, 1]] = results
+
+        j_reflect = np.abs(np.arange(self.ny*2 + 1) - self.ny)
+        i_reflect = np.abs(np.arange(self.nx*2 + 1) - self.nx)
+        self.LGF = quadrant[j_reflect[:, None], i_reflect[None, :]]
                 
     def LGF_asym(self,n,m):
         Cfund = -0.18124942796
@@ -182,14 +210,64 @@ class sol:
         second_term = 1.0/24.0/np.pi*np.cos(4.0*theta)/r/r
         res = -0.5/np.pi*np.log(r) + Cfund + Integral_val + second_term
         return res
+
+    def LGF_asym_const(self):
+        if self._lgf_asym_const is not None:
+            return self._lgf_asym_const
+
+        rho = self.xyratio
+        def integrand(t):
+            if t == 0:
+                return 0
+            a = 2 + 2 * rho * rho - 2 * rho * rho * np.cos(t)
+            K = (a + np.sqrt(a * a - 4)) / 2
+            q = 2 * rho * t / (K - 1 / K)
+            return (q - 1) / t
+
+        val = scipy.integrate.quad(integrand, 0, np.pi, points=[0], epsabs=1e-10, epsrel=1e-10, limit=200)[0]
+        self._lgf_asym_const = np.euler_gamma + np.log(np.pi) + val
+        return self._lgf_asym_const
+
+    def effective_lgf_asym_cutoff(self):
+        if self.lgf_asym_cutoff is None:
+            return None
+        if self.lgf_asym_cutoff <= 0:
+            return self.lgf_asym_cutoff
+
+        safe_direct_cutoff = max(10, self.lgf_quad_n // 200)
+        return min(self.lgf_asym_cutoff, safe_direct_cutoff)
+
+    def LGF_asym_rect(self, n, m):
+        scalar_input = np.ndim(n) == 0 and np.ndim(m) == 0
+        n = np.abs(np.asarray(n, dtype=float))
+        m = np.abs(np.asarray(m, dtype=float))
+
+        rho = self.xyratio
+        x = m
+        y = n / rho
+        R = np.sqrt(x * x + y * y)
+        at_origin = R == 0
+        safe_R = np.where(at_origin, 1.0, R)
+        theta = np.arctan2(y, x)
+
+        leading = (np.log(safe_R) + self.LGF_asym_const() + np.log(rho)) / (2 * np.pi * rho)
+        correction = -(
+            (1 + 1 / (rho * rho)) * np.cos(4 * theta) / (48 * np.pi * rho)
+            + (1 / (rho * rho) - 1) * np.cos(2 * theta) / (24 * np.pi * rho)
+        ) / (safe_R * safe_R)
+        result = np.where(at_origin, 0.0, leading + correction)
+        if scalar_input:
+            return float(result)
+        return result
                 
     def eval_lgf(self, n, m):
-        integrand = lambda t: self.integrand_g(t, n, m)
-        val1 = scipy.integrate.quad(integrand, -np.pi, -1e-15)
-        val2 = scipy.integrate.quad(integrand, 1e-15, np.pi)
-        #val2 = scipy.integrate.quad(integrand, -np.pi, np.pi)
-        val = val1[0] + val2[0]
-        return val
+        cutoff = self.effective_lgf_asym_cutoff()
+        if cutoff is not None and abs(n) + abs(m) > cutoff:
+            return self.LGF_asym_rect(n, m)
+
+        t = -np.pi + (np.arange(self.lgf_quad_n) + 0.5) * 2 * np.pi / self.lgf_quad_n
+        val = np.mean(self.integrand_g(t, n, m)) * 2 * np.pi
+        return val.real
     
     def integrand_g(self, t, n, m):
         a = 2 + 2 * self.xyratio2 - np.cos(t)*2*self.xyratio2
@@ -213,7 +291,7 @@ class sol:
                     
     def init_shape(self):
         r = 0.5
-        self.nIBP = int(np.ceil(np.pi*2*r / self.dx / self.dxibdx))
+        self.nIBP = int(np.ceil(np.pi*2*r / min(self.dx, self.dy) / self.dxibdx))
         self.IBP = np.zeros((self.nIBP, 2))
         for i in range(self.nIBP):
             th = 2*np.pi*i/self.nIBP
@@ -246,7 +324,7 @@ class sol:
         #use edge as benchmarking location
         self.P = []
         for i in range(self.nIBP):
-            self.P.append([scipy.sparse.csr_matrix((self.ny, self.nx)), scipy.sparse.csr_matrix((self.ny, self.nx))])
+            self.P.append([scipy.sparse.lil_matrix((self.ny, self.nx)), scipy.sparse.lil_matrix((self.ny, self.nx))])
             x = self.IBP[i,0]
             y = self.IBP[i,1]
             
@@ -268,6 +346,18 @@ class sol:
                         self.P[i][1][y_pts, x_pts] = v1
                     #self.P[i][0][y_pts, x_pts] = self.delta_func(x_pts - x_loc) * self.delta_func(y_pts + 0.5 - y_loc)
                     #self.P[i][1][y_pts, x_pts] = self.delta_func(x_pts + 0.5 - x_loc) * self.delta_func(y_pts - y_loc)
+            self.P[i][0] = self.P[i][0].tocsr()
+            self.P[i][1] = self.P[i][1].tocsr()
+
+    def assemble_projection_operators(self):
+        n_grid = self.ny*self.nx
+        self.P_matrix = [
+            scipy.sparse.vstack(
+                [self.P[i][component].reshape((1, n_grid)) for i in range(self.nIBP)],
+                format="csr",
+            )
+            for component in range(2)
+        ]
             
     def Schur(self, source, target):
         tmp = np.zeros(self.p.shape)
@@ -276,28 +366,18 @@ class sol:
         self.Grad(tmp, target)
         
     def smearing(self, source, target):
-        for i in range(self.nIBP):
-            target[0] += self.P[i][0]*source[i][0]
-            target[1] += self.P[i][1]*source[i][1]
+        target[0] += np.asarray(self.P_matrix[0].T @ source[:, 0]).reshape(self.ny, self.nx)
+        target[1] += np.asarray(self.P_matrix[1].T @ source[:, 1]).reshape(self.ny, self.nx)
             
     def projection(self, source, target):
-        for i in range(self.nIBP):
-            target[i][0] = np.sum(self.P[i][0].multiply(source[0]))
-            target[i][1] = np.sum(self.P[i][1].multiply(source[1]))
+        target[:, 0] = self.P_matrix[0] @ source[0].ravel()
+        target[:, 1] = self.P_matrix[1] @ source[1].ravel()
         
     def ET_H_S_E(self, source, target, stage):
-        tmp = [scipy.sparse.csr_matrix((self.ny, self.nx)), scipy.sparse.csr_matrix((self.ny, self.nx))]
-        #smearing
-        tmp[0][:,:] = 0
-        tmp[1][:,:] = 0
-        for i in range(self.nIBP):
-            tmp[0] += self.P[i][0]*source[i][0]
-            tmp[1] += self.P[i][1]*source[i][1]
+        tmpNp = np.zeros((2, self.ny, self.nx))
+        self.smearing(source, tmpNp)
             
         #Apply IF
-        tmpNp = np.zeros((2, self.ny, self.nx))
-        tmpNp[0] = tmp[0].todense()
-        tmpNp[1] = tmp[1].todense()
         self.Apply_IF_vec(tmpNp, tmpNp, stage)
         
         #Apply Schur
@@ -307,24 +387,16 @@ class sol:
         #Add
         tmpNp -= self.face_aux2
         
-        #Project
-        for i in range(self.nIBP):
-            target[i][0] = np.sum(self.P[i][0].multiply(tmpNp[0]))
-            target[i][1] = np.sum(self.P[i][1].multiply(tmpNp[1]))
+        self.projection(tmpNp, target)
             
     def ET_H_S_E_Mat(self):
         self.IBMat = np.zeros((3, 2*self.nIBP, 2*self.nIBP))
         for stage in range(3):
             self.IBMat[stage, :,:] = 0
-            tmp = [scipy.sparse.csr_matrix((self.ny, self.nx)), scipy.sparse.csr_matrix((self.ny, self.nx))]
             #smearing
             for i in range(self.nIBP):
-                tmp[0][:,:] = self.P[i][0][:,:]
-                tmp[1][:,:] = 0
-
                 tmpNp = np.zeros((2, self.ny, self.nx))
-                tmpNp[0] = tmp[0].todense()
-                tmpNp[1] = tmp[1].todense()
+                tmpNp[0] = self.P[i][0].toarray()
                 self.Apply_IF_vec(tmpNp, tmpNp, stage)
 
                 self.face_aux2[:,:,:] = 0
@@ -332,16 +404,11 @@ class sol:
 
                 tmpNp -= self.face_aux2
 
-                for j in range(self.nIBP):
-                    self.IBMat[stage, 2 * i, j*2] = np.sum(self.P[j][0].multiply(tmpNp[0]))
-                    self.IBMat[stage, 2 * i, j*2 + 1] = np.sum(self.P[j][1].multiply(tmpNp[1]))
-
-                tmp[0][:,:] = 0
-                tmp[1][:,:] = self.P[i][1][:,:]
+                self.IBMat[stage, 0::2, 2*i] = self.P_matrix[0] @ tmpNp[0].ravel()
+                self.IBMat[stage, 1::2, 2*i] = self.P_matrix[1] @ tmpNp[1].ravel()
 
                 tmpNp = np.zeros((2, self.ny, self.nx))
-                tmpNp[0] = tmp[0].todense()
-                tmpNp[1] = tmp[1].todense()
+                tmpNp[1] = self.P[i][1].toarray()
                 self.Apply_IF_vec(tmpNp, tmpNp, stage)
 
                 self.face_aux2[:,:,:] = 0
@@ -349,9 +416,8 @@ class sol:
 
                 tmpNp -= self.face_aux2
 
-                for j in range(self.nIBP):
-                    self.IBMat[stage, 2 * i + 1, j*2] = np.sum(self.P[j][0].multiply(tmpNp[0]))
-                    self.IBMat[stage, 2 * i + 1, j*2 + 1] = np.sum(self.P[j][1].multiply(tmpNp[1]))
+                self.IBMat[stage, 0::2, 2*i + 1] = self.P_matrix[0] @ tmpNp[0].ravel()
+                self.IBMat[stage, 1::2, 2*i + 1] = self.P_matrix[1] @ tmpNp[1].ravel()
             
     
     def LinearOperatorForCG(self, source, stage):
@@ -383,20 +449,63 @@ class sol:
         return target_tmp
     
     def Direct_solve(self, source, stage):
-        source_tmp = np.zeros(source.shape)
-        source_tmp[:,:] = source[:,:]
-        source_tmp.shape = (self.nIBP * 2,)
-        
-        target_tmp = scipy.linalg.solve(self.IBMat[stage], source_tmp)
-        #print('the exit code is', exit_code)
-        target_tmp.shape = source.shape
-        return target_tmp
-    
+        source_tmp = np.asarray(source).reshape(self.nIBP*2)
+        target_tmp = scipy.linalg.lu_solve(self.IBMat_lu[stage], source_tmp)
+        return target_tmp.reshape(source.shape)
+
+    def total_ib_force(self, stage=2):
+        return np.sum(self.forcing, axis=0) * self.dx * self.dy / (self.dt*self.coeff_a[stage + 1, stage + 1])
+
+    def ib_matrix_diagnostics(self):
+        diag = []
+        for stage in range(3):
+            mat = self.IBMat[stage]
+            diag.append({
+                "stage": stage,
+                "relative_symmetry_error": np.linalg.norm(mat - mat.T) / np.linalg.norm(mat),
+                "condition_number": np.linalg.cond(mat),
+            })
+        return diag
+
+    def _reflection_pairs_y(self, y_offset):
+        rows = []
+        for j in range(self.ny):
+            j_ref = int(round(2*self.ny_ll - 2*y_offset - j))
+            if 0 <= j_ref < self.ny and j <= j_ref:
+                rows.append((j, j_ref))
+        return rows
+
+    def reflection_error_y(self, field, parity, y_offset=0.0):
+        if parity not in (-1, 1):
+            raise ValueError("parity must be 1 for even symmetry or -1 for odd symmetry")
+
+        diff_norm2 = 0.0
+        ref_norm2 = 0.0
+        max_abs = 0.0
+        for j, j_ref in self._reflection_pairs_y(y_offset):
+            diff = field[j, :] - parity*field[j_ref, :]
+            diff_norm2 += np.sum(diff*diff)
+            ref_norm2 += np.sum(field[j, :]*field[j, :])
+            if j != j_ref:
+                ref_norm2 += np.sum(field[j_ref, :]*field[j_ref, :])
+            max_abs = max(max_abs, np.max(np.abs(diff)))
+
+        return {
+            "relative_l2": np.sqrt(diff_norm2) / (np.sqrt(ref_norm2) + 1e-30),
+            "max_abs": max_abs,
+        }
+
+    def flow_symmetry_diagnostics(self):
+        return {
+            "u_x_even": self.reflection_error_y(self.u[0], 1, y_offset=0.5),
+            "u_y_odd": self.reflection_error_y(self.u[1], -1, y_offset=0.0),
+            "omega_odd": self.reflection_error_y(self.omega[0], -1, y_offset=0.0),
+        }
+
     def pressure_correction(self, source, target):
-        tmp = [scipy.sparse.csr_matrix((self.ny, self.nx)), scipy.sparse.csr_matrix((self.ny, self.nx))]
+        tmp = np.zeros((2, self.ny, self.nx))
         self.smearing(source, tmp)
-        self.face_aux2[0,:,:] = tmp[0].todense()[:,:]
-        self.face_aux2[1,:,:] = tmp[1].todense()[:,:]
+        self.face_aux2[:,:,:] = tmp
         self.Div(self.face_aux2, self.cell_aux2)
         self.Apply_lgf_vec(self.cell_aux2, self.cell_aux2)
         target -= self.cell_aux2
@@ -453,15 +562,13 @@ class sol:
         return res
     
     def Apply_lgf_vec(self, source, target):
-        n_proc = min(len(source), mp.cpu_count())
-        if n_proc > 1:
-            with mp.pool.ThreadPool(processes=n_proc) as pool:
-                results = pool.starmap(self.Apply_lgf, [(s, 1) for s in source])
-            for i, res in enumerate(results):
-                target[i] = res
-        else:
-            for i in range(len(source)):
-                target[i] = self.Apply_lgf(source[i], workers=-1)
+        field_fft = scipy.fft.fft2(
+            source, self.fft_shape, axes=(-2, -1), workers=-1
+        )
+        res = scipy.fft.ifft2(
+            field_fft*self.LGF_fft, axes=(-2, -1), workers=-1
+        )
+        target[:] = res[:, self.lgf_slice[0], self.lgf_slice[1]].real*self.dx*self.dx
     
     def Apply_IF(self, field, stage, workers=-1):
         field_fft = scipy.fft.fft2(field, self.if_fft_shape, workers=workers)
@@ -471,19 +578,18 @@ class sol:
         return res
     
     def Apply_IF_vec(self, source, target, stage):
-        n_proc = min(len(source), mp.cpu_count())
-        if n_proc > 1:
-            with mp.pool.ThreadPool(processes=n_proc) as pool:
-                results = pool.starmap(self.Apply_IF, [(s, stage, 1) for s in source])
-            for i, res in enumerate(results):
-                target[i] = res
-        else:
-            for i in range(len(source)):
-                target[i] = self.Apply_IF(source[i], stage, workers=-1)
+        field_fft = scipy.fft.fft2(
+            source, self.if_fft_shape, axes=(-2, -1), workers=-1
+        )
+        res = scipy.fft.ifft2(
+            field_fft*self.IF_fft[stage], axes=(-2, -1), workers=-1
+        )
+        target[:] = res[:, self.if_slice[0], self.if_slice[1]].real
     
     def Dx(self, field):
-        
-        res = scipy.signal.convolve(field, self.dx_v, mode='same')
+        res = np.empty_like(field)
+        res[:, 0] = field[:, 0]/self.dx
+        res[:, 1:] = (field[:, 1:] - field[:, :-1])/self.dx
         return res
     
     def Dx_t(self, field):
@@ -491,22 +597,54 @@ class sol:
         #so it is sum_{i+j = k} K(i)g(j) = sum_{i+j = 0} K(i)g(k+j)
         #K(0) = -1, K(-1) = 1
 
-        res = scipy.signal.convolve(field, self.dx_v_t, mode='same')
+        res = np.empty_like(field)
+        res[:, :-1] = (field[:, 1:] - field[:, :-1])/self.dx
+        res[:, -1] = -field[:, -1]/self.dx
         return res
     
     def Dy(self, field):
-        res = scipy.signal.convolve(field, self.dy_v, mode='same')
+        res = np.empty_like(field)
+        res[0, :] = field[0, :]/self.dy
+        res[1:, :] = (field[1:, :] - field[:-1, :])/self.dy
         return res
     
     def Dy_t(self, field):
-        res = scipy.signal.convolve(field, self.dy_v_t, mode='same')
+        res = np.empty_like(field)
+        res[:-1, :] = (field[1:, :] - field[:-1, :])/self.dy
+        res[-1, :] = -field[-1, :]/self.dy
         return res
     
-    def cleanBdry(self, field, n_grid = 1):
+    def cleanBdry(self, field, n_grid=1, grid_location="cell"):
+        """Zero boundary layers without breaking staggered-grid symmetry.
+
+        Cell-centered fields use half-integer coordinates in both directions.
+        Node-centered fields use integer coordinates, while face fields have
+        integer x coordinates for the x component and integer y coordinates
+        for the y component.  An integer-centered grid has one more point on
+        its lower side, so that side needs one additional zeroed layer.
+        """
+        if n_grid <= 0:
+            return
+        if grid_location not in ("cell", "node", "face"):
+            raise ValueError("grid_location must be 'cell', 'node', or 'face'")
+        if grid_location == "face" and len(field) != 2:
+            raise ValueError("face-centered fields must have two components")
+
         for i in range(len(field)):
-            field[i, 0:n_grid,:] = 0
+            lower_y = n_grid
+            lower_x = n_grid
+            if grid_location == "node":
+                lower_y += 1
+                lower_x += 1
+            elif grid_location == "face":
+                if i == 0:  # x velocity: integer x, half-integer y
+                    lower_x += 1
+                else:       # y velocity: half-integer x, integer y
+                    lower_y += 1
+
+            field[i, 0:lower_y, :] = 0
             field[i, -n_grid:, :] = 0
-            field[i, :, 0:n_grid] = 0
+            field[i, :, 0:lower_x] = 0
             field[i, :, -n_grid:] = 0
     
     def Div(self, source, target):
@@ -530,14 +668,14 @@ class sol:
         if (len(source) != 1):
             print("wrong field for curl transpose")
         target[0] = self.Dy_t(source[0])
-        target[1] -= self.Dx_t(source[0])
+        target[1] = -self.Dx_t(source[0])
 
     def velocity_refresh(self, vel, vort):
         self.Curl(vel, vort)
-        self.cleanBdry(vort, 6)
+        self.cleanBdry(vort, 6, grid_location="node")
         self.Apply_lgf_vec(vort, self.stream)
         self.Curl_t(self.stream, self._u_refresh)
-        self.cleanBdry(self._u_refresh, 1)
+        self.cleanBdry(self._u_refresh, 1, grid_location="face")
         self._u_refresh *= -1
         self.assign_bdry(self._u_refresh, vel, 6)
         
@@ -554,44 +692,32 @@ class sol:
         #vel[:,:,:] = vel_raw[:,:,:] - self.U_inf()
         vel[0,:,:] = vel_raw[0,:,:] - self.U_inf()
         vel[1,:,:] = vel_raw[1,:,:]
-        avg_x_f = np.zeros((1,3))
-        avg_x_f[0,0] = 0.5
-        avg_x_f[0,1] = 0.5
-        avg_x_f[0,2] = 0
-        
-        avg_x_b = np.zeros((1,3))
-        avg_x_b[0,0] = 0
-        avg_x_b[0,1] = 0.5
-        avg_x_b[0,2] = 0.5
-        
-        avg_y_f = np.zeros((3,1))
-        avg_y_f[0] = 0.5
-        avg_y_f[1] = 0.5
-        avg_y_f[2] = 0
-        
-        avg_y_b = np.zeros((3,1))
-        avg_y_b[0] = 0
-        avg_y_b[1] = 0.5
-        avg_y_b[2] = 0.5
-        
-        v_avg = scipy.signal.convolve(vel[1], avg_x_b, mode='same')
-        u_avg = scipy.signal.convolve(vel[0], avg_y_b, mode='same')
+
+        v_avg = np.empty_like(vel[1])
+        v_avg[:, 0] = 0.5*vel[1, :, 0]
+        v_avg[:, 1:] = 0.5*(vel[1, :, 1:] + vel[1, :, :-1])
+        u_avg = np.empty_like(vel[0])
+        u_avg[0, :] = 0.5*vel[0, 0, :]
+        u_avg[1:, :] = 0.5*(vel[0, 1:, :] + vel[0, :-1, :])
         
         tmp_0 = -np.multiply(vort[0], v_avg)
         tmp_1 =  np.multiply(vort[0], u_avg)
         
-        target[0] = scipy.signal.convolve(tmp_0, avg_y_f, mode='same')
-        target[1] = scipy.signal.convolve(tmp_1, avg_x_f, mode='same')
+        target[0, :-1, :] = 0.5*(tmp_0[:-1, :] + tmp_0[1:, :])
+        target[0, -1, :] = 0.5*tmp_0[-1, :]
+        target[1, :, :-1] = 0.5*(tmp_1[:, :-1] + tmp_1[:, 1:])
+        target[1, :, -1] = 0.5*tmp_1[:, -1]
         
     
     def lin_sys_with_ib_solve(self, stage):
         self.Div(self.r_i, self.cell_aux)
+        self.cleanBdry(self.cell_aux, 6)
         self.Apply_lgf_vec(self.cell_aux, self.d_i)
         
         self.face_aux2[:,:,:] = self.r_i[:,:,:]
         
         self.Grad(self.d_i, self.face_aux)
-        self.cleanBdry(self.face_aux, 6)
+        self.cleanBdry(self.face_aux, 6, grid_location="face")
         
         self.face_aux2 -= self.face_aux
         
@@ -600,18 +726,18 @@ class sol:
         self.forcing = self.ib_solve(self.face_aux2, stage)
 
         if stage == 2:
-            F = np.sum(self.forcing, axis=0) * self.dx * self.dy / (self.dt*self.coeff_a[3,3])
+            F = self.total_ib_force(stage)
+            self.force_history.append([self.t, F[0], F[1]])
             print('At ', self.t, ' Total IB force: ', F)
         
         self.pressure_correction(self.forcing, self.d_i)
         self.Grad(self.d_i, self.face_aux)
-        self.cleanBdry(self.face_aux, 6)
+        self.cleanBdry(self.face_aux, 6, grid_location="face")
         
-        tmp = [scipy.sparse.csr_matrix((self.ny, self.nx)), scipy.sparse.csr_matrix((self.ny, self.nx))]
+        tmp = np.zeros((2, self.ny, self.nx))
         self.smearing(self.forcing, tmp)
         
-        self.face_aux[0,:,:] += tmp[0].todense()[:,:]
-        self.face_aux[1,:,:] += tmp[1].todense()[:,:]
+        self.face_aux += tmp
         
         
         self.r_i -= self.face_aux
@@ -622,7 +748,7 @@ class sol:
         self.cleanBdry(self.cell_aux, 6)
         self.Apply_lgf_vec(self.cell_aux, self.d_i)
         self.Grad(self.d_i, self.face_aux)
-        self.cleanBdry(self.face_aux, 6)
+        self.cleanBdry(self.face_aux, 6, grid_location="face")
         self.r_i -= self.face_aux
         self.Apply_IF_vec(self.r_i, self.u_i, stage)
     
@@ -638,7 +764,7 @@ class sol:
         
         
         self.Curl(self.u, self.omega)
-        self.cleanBdry(self.omega, 6)
+        self.cleanBdry(self.omega, 6, grid_location="node")
         self.nonlinear(self.omega, self.u, self.face_aux, self.g_i)
         self.g_i *= (-dt)*self.coeff_a[1,1]
         self.r_i[:,:,:] = self.q_i[:,:,:]
@@ -666,7 +792,7 @@ class sol:
         self.r_i += self.w_1 * self.coeff_a[2,1] * dt
         
         self.Curl(self.u_i, self.omega)
-        self.cleanBdry(self.omega, 6)
+        self.cleanBdry(self.omega, 6, grid_location="node")
         self.nonlinear(self.omega, self.u_i, self.face_aux, self.g_i)
         self.g_i *= (-dt)*self.coeff_a[2,2]
         
@@ -693,7 +819,7 @@ class sol:
         self.Apply_IF_vec(self.r_i, self.r_i, 1)
         
         self.Curl(self.u_i, self.omega)
-        self.cleanBdry(self.omega, 6)
+        self.cleanBdry(self.omega, 6, grid_location="node")
         self.nonlinear(self.omega, self.u_i, self.face_aux, self.g_i)
         self.g_i *= (-dt)*self.coeff_a[3,3]
         self.r_i += self.g_i
@@ -710,13 +836,21 @@ class sol:
         self.p[:,:,:] = self.d_i[:,:,:]
         self.p /= (self.coeff_a[3,3] * dt)
         
-    def time_march(self, n_steps):
+    def time_march(self, n_steps, refresh_interval=None, record_symmetry=False, verbose=True):
         for i in range(n_steps):
             self.IFHERK_step(self.dt)
-            print('step ',i)
+            if record_symmetry:
+                self.symmetry_history.append({
+                    "step": i,
+                    "time": self.t,
+                    **self.flow_symmetry_diagnostics(),
+                })
+            if verbose:
+                print('step ',i)
 
-            if ((i + 1) % 50 == 0):
-                print('Refreshing velocity field at step ', i+1)
+            if refresh_interval is not None and refresh_interval > 0 and ((i + 1) % refresh_interval == 0):
+                if verbose:
+                    print('Refreshing velocity field at step ', i+1)
                 self.velocity_refresh(self.u, self.omega)
                 
         
